@@ -21,7 +21,7 @@ Adafruit_BNO055 bno(55, BNO_ADDR, &Wire);
 SMS_STS st;
 
 const int NUM_SERVOS = 6;
-const uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 3, 4, 5, 6};  
+const uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 5, 4, 6, 3};  
 
 const float SHAFT_ANGLE_DEG[NUM_SERVOS] = {258.0f, 162.0f, 138.0f, 42.0f, 18.0f, 282.0f};
 

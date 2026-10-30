@@ -6,8 +6,8 @@
 #include <SMS_STS.h>
 
 #define BNO_ADDR 0x28
-#define I2C_SDA  21
-#define I2C_SCL  22
+#define I2C_SDA  22
+#define I2C_SCL  23
 Adafruit_BNO055 bno(55, BNO_ADDR, &Wire);
 
 #define S_RXD 18
@@ -15,7 +15,7 @@ Adafruit_BNO055 bno(55, BNO_ADDR, &Wire);
 SMS_STS st;
 
 const int NUM_SERVOS = 6;
-uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 3, 4, 5, 6};
+uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 5, 4, 6, 3};
 
 #define HOME_POS      2048
 #define SERVO_SPEED   3073
@@ -25,8 +25,8 @@ const int   MAX_DELTA_TICKS = 500;
 
 const int SERVO_DIR[NUM_SERVOS] = {+1, -1, +1, -1, +1, -1};
 
-const float R_SERVO   = 0.200f;   
-const float R_PLAT    = 0.200f;  
+const float R_SERVO   = 0.113f;   
+const float R_PLAT    = 0.125f;  
 const float GAMMA_DEG = 12.0f;   
 const float HORN_LEN  = 0.020f;  
 const float ROD_LEN   = 0.156f;  
@@ -42,7 +42,7 @@ float Kd = 0.0f;
 const float INTEGRAL_LIMIT = 2.0f;
 const float MAX_ANGLE      = 20.0f;    
 
-const bool  SWAP_ROLL_PITCH = false;
+const bool  SWAP_ROLL_PITCH = true;
 const float ROLL_SIGN  = +1.0f;
 const float PITCH_SIGN = +1.0f;
 
@@ -65,7 +65,7 @@ static float angDiffDeg(float a, float b) { return fmodf(a - b + 540.0f, 360.0f)
 void rotationMatrix(float rollDeg, float pitchDeg, float yawDeg, float R[3][3]) {
   float r = radians(rollDeg), p = radians(pitchDeg), y = radians(yawDeg);
   float cr = cosf(r), sr = sinf(r), cp = cosf(p), sp = sinf(p), cy = cosf(y), sy = sinf(y);
-  float M[3][3] = {{cp, 0, sp}, {sr * sp, cr, -sr * cp}, {-cr * sp, sr, cr * cp}};   // Rx * Ry
+  float M[3][3] = {{cp, 0, sp}, {sr * sp, cr, -sr * cp}, {-cr * sp, sr, cr * cp}};   
   for (int i = 0; i < 3; i++) {
     R[i][0] = M[i][0] * cy + M[i][1] * sy;
     R[i][1] = -M[i][0] * sy + M[i][1] * cy;
