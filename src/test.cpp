@@ -3,13 +3,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <SMS_STS.h>
-#include <WiFi.h>
 
-const char* ssid = "dkg";
-const char* password = "c4di3qit";
-
-WiFiServer telnetServer(23);
-WiFiClient telnetClient;
 
 #define BNO_ADDR 0x28
 #define I2C_SDA  22
@@ -21,7 +15,7 @@ Adafruit_BNO055 bno(55, BNO_ADDR, &Wire);
 SMS_STS st;
 
 const int NUM_SERVOS = 6;
-const uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 3, 4, 6, 5};  
+const uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 3, 4, 5, 6};  
 
 const float SHAFT_ANGLE_DEG[NUM_SERVOS] = {258.0f, 162.0f, 138.0f, 42.0f, 18.0f, 282.0f};
 
@@ -234,22 +228,6 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  WiFi.begin(ssid, password);
-
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  Serial.println("\nWiFi connected.");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  telnetServer.begin();
-  telnetServer.setNoDelay(true);
-  Serial.println("Telnet server started on port 23");
-
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!bno.begin(OPERATION_MODE_IMUPLUS)) {
     Serial.println("No BNO055 detected (check wiring and address 0x28). Servo tests still work.");
@@ -274,27 +252,6 @@ void loop() {
   static uint32_t lastPrint = 0;
 
   if (Serial.available()) handleCommand(Serial.readStringUntil('\n'));
-
-  if (telnetServer.hasClient()) {
-    if (!telnetClient || !telnetClient.connected()) {
-      if (telnetClient) telnetClient.stop();
-      telnetClient = telnetServer.available();
-      telnetClient.println("Welcome to ESP32 Telnet Server!");
-      Serial.println("New Telnet client connected.");
-    } else {
-      telnetServer.available().stop();
-    }
-  }
-
-  if (telnetClient && telnetClient.connected() && telnetClient.available()) {
-    while (telnetClient.available()) {
-      Serial.write(telnetClient.read());
-    }
-  }
-
-  if (Serial.available() && telnetClient && telnetClient.connected()) {
-    telnetClient.write(Serial.read());
-  }
 
   if (imuStream && imuOk && millis() - lastPrint >= 100) {
     lastPrint = millis();

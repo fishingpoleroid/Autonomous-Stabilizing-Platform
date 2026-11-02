@@ -22,7 +22,7 @@ SMS_STS st;
 
 const int NUM_SERVOS = 6;
 // Servo ID of each IK leg (leg 0..5 = the sim's phi arrays, see the table printed at boot).
-uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 5, 4, 6, 3};
+uint8_t SERVO_IDS[NUM_SERVOS] = {1, 2, 3, 4, 5, 6};
 
 #define HORN_ZERO_TICK 2048         // servo tick where the horn is exactly HORIZONTAL
 #define SERVO_SPEED    3073
@@ -33,11 +33,8 @@ const float TICKS_PER_DEG = 4096.0f / 360.0f;
 // Verify each servo with test_pid_single's "horn 20" command (the horn must rise).
 const int SERVO_DIR[NUM_SERVOS] = {+1, -1, +1, -1, +1, -1};
 
-// ================================================================== horn travel
-// The horns can swing about 90 deg UP but only ~20-30 deg DOWN (they hit the base).
-// Poses that need more are scaled down instead of being sent to the servos.
-float HORN_MAX_UP_DEG   = 180.0f;
-float HORN_MAX_DOWN_DEG = 180.0f;
+float HORN_MAX_UP_DEG   = 90.0f;
+float HORN_MAX_DOWN_DEG = 90.0f;
 
 // Horn angle above horizontal when the platform is at its home pose. Raising it centres the
 // useful travel (up 85 / down 20 around horizontal is very lopsided). Set 0 for horizontal horns.
@@ -61,7 +58,7 @@ const bool HORN_TOWARD_PAIR_CENTER = true;
 // ================================================================== IMU axis mapping
 // Use the guided test in test.cpp to find these.
 const bool  SWAP_ROLL_PITCH = true;
-const float ROLL_SIGN  = +1.0f;
+const float ROLL_SIGN  = -1.0f;
 const float PITCH_SIGN = +1.0f;
 
 // ================================================================== derived geometry state
