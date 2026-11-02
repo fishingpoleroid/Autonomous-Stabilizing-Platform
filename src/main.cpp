@@ -1,43 +1,3 @@
-/*
- * Stewart platform leveling - rotary (servo horn + pushrod) version  -- FIXED VERSION
- * ESP32 + BNO055 (on top plate) + 6x ST3215 on a Waveshare bus servo driver
- *
- * Fixes for "the platform responds at irregular times, then goes to sleep, in cycles":
- *
- *  1. NEVER FREEZE ON AN UNREACHABLE POSE. The old loop did
- *         if (solveIK(...)) sendHornAngles(alpha);   // else: hold last command
- *     With the geometry in this file only ~6 deg of tilt is reachable, but MAX_TILT_CMD_DEG was 20 and
- *     Kp was 4, so any error above ~1.5 deg asked for an unreachable pose and the servos just stopped.
- *     Now solveSafe() scales the command back (bisection) to the largest reachable pose and ALWAYS
- *     sends something. Reachable = IK solvable AND every horn within SERVO_LIMIT_DEG of home.
- *
- *  2. CONTROLLER STATE FOLLOWS WHAT IS REACHABLE (anti-windup). The tilt command is the integrator
- *     state; when the pose had to be scaled back, the state is scaled back too.
- *
- *  3. INCREMENTAL PID (replaces the per-sample position-form PID). The IMU is on the platform, so it
- *     measures base tilt + commanded tilt. A position-form law (cmd = Kp * -tilt, Kp = 4) has loop
- *     gain > 1 around a fast servo and rings between the clamps, which then hits (1). The incremental
- *     form (Wokwi rotary Stewart project; Beauregard "Improving the Beginner's PID"; velocity form
- *     per D. Cooper) integrates the correction, has proper integral action and cannot wind up.
- *     Gains are now per second (Ki) / in seconds (Kd) and the real dt is measured every cycle.
- *
- *  4. ROBUST IMU READ (taken from the earlier controller that did not stall):
- *       - quaternion read straight from the BNO055 registers so a failed I2C transfer is detected,
- *         with a unit-norm sanity check, instead of bno.getQuat() which cannot report failure
- *       - I2C at 100 kHz and a 10 ms timeout (the BNO055 stretches the clock; 400 kHz is unreliable
- *         on the ESP32, and a timeout stalls the whole loop for tens of ms)
- *       - setExtCrystalUse(true) REMOVED: on breakouts without an external crystal it can stop the
- *         sensor's clock. The earlier working code never called it.
- *       - after repeated failures the I2C bus is cleared and restarted
- *
- * Serial commands (115200):
- *   kp <v> | ki <v> | kd <v>   set gains
- *   pid 1|0                    enable / disable stabilization
- *   pose <roll> <pitch>        (PID off) command a manual tilt in degrees
- *   home                       (PID off) go to home pose
- *   tare                       re-zero the IMU baseline (platform must be level)
- */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -46,22 +6,14 @@
 #include <Adafruit_BNO055.h>
 #include <SMS_STS.h>
 
-// ============================================================================
-//  USER CONFIG  -- everything marked MEASURE must match your real hardware
-// ============================================================================
-
-// ---- Pins (Waveshare ESP32 bus servo driver board defaults) ----
 static const int  SERVO_RX_PIN = 18;
 static const int  SERVO_TX_PIN = 19;
 static const long SERVO_BAUD   = 1000000;
-static const int  IMU_SDA_PIN  = 22;   // change if your BNO055 is wired elsewhere
+static const int  IMU_SDA_PIN  = 22;  
 static const int  IMU_SCL_PIN  = 23;
-#define BNO_ADDR 0x28                  // use 0x29 if the ADR pin is high
+#define BNO_ADDR 0x28                 
 
-// ---- Servos ----
-// Index i below = leg i. Leg i connects BASE_ANG[i] to PLAT_ANG[i] (see initGeometry).
 static u8   SERVO_IDS[6] = {1, 2, 3, 4, 5, 6};
-// +1 / -1: flips direction if a horn moves the wrong way (verify with `pose` command).
 static const int8_t SERVO_DIR[6] = {+1, +1, +1, +1, +1, +1};
 static const int    SERVO_CENTER = 2048;                 // horn must be at its "home" angle here
 static const float  COUNTS_PER_DEG = 4096.0f / 360.0f;   // ST3215: 4096 counts / rev
@@ -71,12 +23,12 @@ static const u8     SERVO_ACC   = 0;                     // 0 = no accel ramp (f
 
 // ---- Geometry (metres / degrees) ----
 // Base anchor = servo shaft axis point. Platform anchor = rod end on the top plate.
-static const float R_BASE   = 0.200f;   // MEASURE: radius of servo shaft circle
-static const float R_PLAT   = 0.200f;   // MEASURE: radius of rod-end circle on top plate
-static const float GAMMA_BASE_DEG = 12.0f;  // MEASURE: half the angle between a servo pair
-static const float GAMMA_PLAT_DEG = 12.0f;  // MEASURE: half the angle between a rod-end pair
-static const float HORN_LEN = 0.040f;   // MEASURE: servo horn length (shaft centre -> rod pivot)
-static const float ROD_LEN  = 0.150f;   // MEASURE: pushrod length (ball-joint centre to centre)
+static const float R_BASE   = 0.110f;   // MEASURE: radius of servo shaft circle
+static const float R_PLAT   = 0.120f;   // MEASURE: radius of rod-end circle on top plate
+static const float GAMMA_BASE_DEG = 30.0f;  // MEASURE: half the angle between a servo pair
+static const float GAMMA_PLAT_DEG = 35.0f;  // MEASURE: half the angle between a rod-end pair
+static const float HORN_LEN = 0.020f;   // MEASURE: servo horn length (shaft centre -> rod pivot)
+static const float ROD_LEN  = 0.160f;   // MEASURE: pushrod length (ball-joint centre to centre)
 
 // Home height of the top plate above the servo-shaft plane.
 // 0 = auto-compute so that every horn is exactly horizontal at home
@@ -98,7 +50,7 @@ static const float LOOP_HZ = 100.0f;           // BNO055 fusion output is 100 Hz
 //   Kd [s]   degrees of tilt command per (degree/second) of tilt rate
 // Tuning: start with Ki = 0 (platform only half-corrects), raise Ki (5, 10, 15 ...) until it
 // returns to level quickly; if it rings after a knock go back to ~70 %. Kd normally stays 0.
-static float Kp = 0.6f, Ki = 10.0f, Kd = 0.0f;
+static float Kp = 0.1f, Ki = 0.0f, Kd = 0.0f;
 
 // Largest tilt command [deg]. The mechanism may reach less (see the "reach" value in the telemetry);
 // solveSafe() cuts the command back to what is reachable anyway.
