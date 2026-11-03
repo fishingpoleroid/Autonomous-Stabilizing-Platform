@@ -14,7 +14,7 @@ static const int  IMU_SCL_PIN  = 23;
 #define BNO_ADDR 0x28                 
 
 static u8   SERVO_IDS[6] = {1, 2, 3, 4, 5, 6};
-static const int8_t SERVO_DIR[6] = {+1, +1, +1, +1, +1, +1};
+static int8_t SERVO_DIR[6] = {+1, +1, +1, +1, +1, +1};   // +1: positive count raises the horn tip. Change live: "dir <1-6> <+1|-1>"
 static const int    SERVO_CENTER = 2048;                 // horn must be at its "home" angle here
 static const float  COUNTS_PER_DEG = 4096.0f / 360.0f;   // ST3215: 4096 counts / rev
 static const float  SERVO_LIMIT_DEG = 60.0f;             // max horn travel from home (+/-)
@@ -44,13 +44,21 @@ static const float BETA_MANUAL_DEG[6] = {0, 0, 0, 0, 0, 0};
 // ---- Control ----
 static const float LOOP_HZ = 100.0f;           // BNO055 fusion output is 100 Hz
 
-// Incremental PID, one identical loop for roll and pitch. Units are physical:
-//   Kp [-]   degrees of tilt command per degree of tilt change
+// PID, position form, one identical loop for roll and pitch. Same structure as the sim's loop():
+//     err = 0 - measured tilt
+//     cmd = Kp*err + I + Kd*d(err)/dt          (cmd = tilt of the top plate RELATIVE TO THE BASE)
+//   Kp [-]   degrees of tilt command per degree of tilt error
 //   Ki [1/s] degrees of tilt command per second, per degree of error
 //   Kd [s]   degrees of tilt command per (degree/second) of tilt rate
-// Tuning: start with Ki = 0 (platform only half-corrects), raise Ki (5, 10, 15 ...) until it
-// returns to level quickly; if it rings after a knock go back to ~70 %. Kd normally stays 0.
-static float Kp = 0.1f, Ki = 0.0f, Kd = 0.0f;
+//
+// IMPORTANT: the IMU is on the top plate, so  measured = base tilt + commanded tilt.
+// P alone therefore only corrects a fraction Kp/(1+Kp) of the base tilt (Kp=0.1 -> 9 %, Kp=1 -> 50 %,
+// Kp=2 -> 67 %); the I term removes the rest. The sim uses Kp=15 (94 % from P alone) because its
+// actuators have no latency. On the real robot (IMU filter + 100 Hz loop + servo lag) a big Kp
+// oscillates, so keep Kp around 1..2 and raise Ki for stiffness.
+// Tuning: Kd = 0. Start Kp = 1, Ki = 10. Raise Ki (15, 20 ...) for a faster return to level; if it rings
+// after a knock go back to ~70 %. Live: "kp 1.5", "ki 15" ...
+static float Kp = 1.0f, Ki = 10.0f, Kd = 0.0f;
 
 // Largest tilt command [deg]. The mechanism may reach less (see the "reach" value in the telemetry);
 // solveSafe() cuts the command back to what is reachable anyway.
@@ -89,8 +97,8 @@ struct AxisCtl {
   float m = 0;         // filtered measured tilt                      [deg]
   float mPrev = 0;
   float rate = 0;      // filtered tilt rate                          [deg/s]
-  float ratePrev = 0;
-  float cmd = 0;       // commanded platform tilt = controller state  [deg]
+  float iTerm = 0;     // integral term, already multiplied by Ki     [deg]
+  float cmd = 0;       // last applied tilt command (relative to base)[deg]
   bool  primed = false;
 };
 static AxisCtl ctlRoll, ctlPitch;
@@ -295,6 +303,60 @@ static void goToPose(float rollDeg, float pitchDeg) {
   sendHornAngles(alpha);
 }
 
+// ---------------------------------------------------------------------------
+//  Manual roll / pitch test (no IMU, no PID) - verifies the IK and the servo directions
+// ---------------------------------------------------------------------------
+// Largest |rod length - ROD_LEN| over the 6 legs for horn angles alpha[] and tilt (roll, pitch).
+// ~0 means the IK solution really satisfies the rod constraint (checks the IK maths itself).
+static float ikRodError(float rollDeg, float pitchDeg, const float alpha[6]) {
+  Mat3 R = buildR(rollDeg, pitchDeg, 0);
+  float maxErr = 0;
+  for (int i = 0; i < 6; i++) {
+    float qx = R.m[0][0] * px[i] + R.m[0][1] * py[i];
+    float qy = R.m[1][0] * px[i] + R.m[1][1] * py[i];
+    float qz = homeZ + R.m[2][0] * px[i] + R.m[2][1] * py[i];
+    float hx = HORN_LEN * cosf(alpha[i]) * cosf(beta[i]);
+    float hy = HORN_LEN * cosf(alpha[i]) * sinf(beta[i]);
+    float hz = HORN_LEN * sinf(alpha[i]);
+    float dx = qx - bx[i] - hx, dy = qy - by[i] - hy, dz = qz - hz;
+    float err = fabsf(sqrtf(dx * dx + dy * dy + dz * dz) - ROD_LEN);
+    if (err > maxErr) maxErr = err;
+  }
+  return maxErr;
+}
+
+// Moves the top plate to a fixed roll/pitch relative to the base and prints what every leg should do.
+// Check on the real robot: a leg whose plate anchor should RISE must have its horn go UP, one that
+// should DROP must go DOWN. Any servo where the horn moves the other way -> flip its SERVO_DIR ("dir i -1").
+static void manualRollPitch(float rollDeg, float pitchDeg) {
+  float alpha[6];
+  float scale = solveSafe(rollDeg, pitchDeg, alpha);
+  float r = rollDeg * scale, p = pitchDeg * scale;
+  if (scale < 1.0f) Serial.printf("pose out of reach - using %.0f %% of it (roll %.2f pitch %.2f)\n", scale * 100.0f, r, p);
+
+  Mat3 R = buildR(r, p, 0);
+  Serial.printf("manual roll=%.2f pitch=%.2f | IK rod-length error %.6f m (should be ~0)\n", r, p, ikRodError(r, p, alpha));
+  for (int i = 0; i < 6; i++) {
+    float plateDz = (R.m[2][0] * px[i] + R.m[2][1] * py[i]) * 1000.0f;       // plate anchor height change [mm]
+    float deltaDeg = clampf((alpha[i] - alphaHome[i]) * RAD2DEG, -SERVO_LIMIT_DEG, SERVO_LIMIT_DEG);
+    int cnt = SERVO_DIR[i] * (int)lroundf(deltaDeg * COUNTS_PER_DEG);
+    Serial.printf("  servo %u: plate anchor %+6.1f mm | horn %s %+6.2f deg | counts %+5d -> %d | dir %+d\n",
+                  SERVO_IDS[i], plateDz, deltaDeg >= 0 ? "UP  " : "DOWN", deltaDeg, cnt,
+                  (int)constrain(SERVO_CENTER + cnt, 0, 4095), SERVO_DIR[i]);
+  }
+  sendHornAngles(alpha);
+}
+
+// Moves ONE horn by deltaDeg (+ = tip up) with all others at home - checks the direction of each servo.
+static void manualHorn(int idx, float deltaDeg) {
+  float alpha[6];
+  for (int i = 0; i < 6; i++) alpha[i] = alphaHome[i];
+  alpha[idx] += deltaDeg * DEG2RAD;
+  sendHornAngles(alpha);
+  Serial.printf("servo %u horn %+.1f deg (should go %s), dir %+d\n", SERVO_IDS[idx], deltaDeg,
+                deltaDeg >= 0 ? "UP" : "DOWN", SERVO_DIR[idx]);
+}
+
 // ============================================================================
 //  IMU
 // ============================================================================
@@ -363,7 +425,7 @@ static void tareIMU() {
 }
 
 // ============================================================================
-//  Incremental PID
+//  PID (position form, as in the sim)
 // ============================================================================
 // First-order low-pass coefficient for a cutoff in Hz and a sample time dt (1 = no filtering).
 static float lpfAlpha(float cutoffHz, float dt) {
@@ -372,28 +434,40 @@ static float lpfAlpha(float cutoffHz, float dt) {
   return dt / (rc + dt);
 }
 
-// One control step for one axis; the target tilt is 0. Returns the new tilt command [deg].
-// P and D act on the measurement; the command itself is the integrator state, so the limits below
-// are also the anti-windup.
+// One control step for one axis; the target tilt is 0. Returns the new tilt command [deg] of the top
+// plate relative to the base:   cmd = Kp*err + iTerm - Kd*rate,   err = -measured tilt.
+// (With a zero target, D on the error and D on the measurement are the same thing.)
+// iTerm is stored in degrees, so changing Ki on the fly does not make the command jump.
+// Anti-windup by back-calculation: whenever the output is cut (tilt limit or rate limit), iTerm is
+// pulled back by the same amount, so the integrator never runs away from what was actually applied.
 static float axisUpdate(AxisCtl &a, float meas, float dt) {
-  if (!a.primed) {                                   // start without a jump
+  if (!a.primed) {                                   // bumpless start: output begins at the current cmd
     a.m = a.mPrev = meas;
-    a.rate = a.ratePrev = 0.0f;
+    a.rate = 0.0f;
+    a.iTerm = clampf(a.cmd - Kp * (-a.m), -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);
     a.primed = true;
   }
   a.mPrev = a.m;
   a.m += lpfAlpha(MEAS_LPF_HZ, dt) * (meas - a.m);
-  a.ratePrev = a.rate;
   a.rate += lpfAlpha(D_LPF_HZ, dt) * ((a.m - a.mPrev) / dt - a.rate);
 
   float err = -a.m;
-  float delta = -Kp * (a.m - a.mPrev)                // P on measurement
-              +  Ki * err * dt                       // I
-              -  Kd * (a.rate - a.ratePrev);         // D on measurement
+  a.iTerm = clampf(a.iTerm + Ki * err * dt, -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);
+  float unsat = Kp * err + a.iTerm - Kd * a.rate;
+
   float maxStep = MAX_TILT_RATE_DPS * dt;
-  delta = clampf(delta, -maxStep, maxStep);
-  a.cmd = clampf(a.cmd + delta, -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);
-  return a.cmd;
+  float out = clampf(unsat, a.cmd - maxStep, a.cmd + maxStep);   // slew-rate limit
+  out = clampf(out, -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);        // tilt limit
+
+  a.iTerm = clampf(a.iTerm + (out - unsat), -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);   // back-calculation
+  a.cmd = out;
+  return out;
+}
+
+// Used when the mechanism cannot reach the command: shrink the command and keep the integrator consistent.
+static void axisForceCmd(AxisCtl &a, float newCmd) {
+  a.iTerm = clampf(a.iTerm + (newCmd - a.cmd), -MAX_TILT_CMD_DEG, MAX_TILT_CMD_DEG);
+  a.cmd = newCmd;
 }
 
 // ============================================================================
@@ -411,11 +485,28 @@ static void handleLine(char *line) {
     else goToPose(manualRoll, manualPitch);
     Serial.printf("PID %s\n", pidEnabled ? "ON" : "OFF");
   }
-  else if (sscanf(line, "pose %f %f", &a, &b) == 2) {
+  else if (sscanf(line, "manual %f %f", &a, &b) == 2 || sscanf(line, "pose %f %f", &a, &b) == 2) {
     pidEnabled = false;
     manualRoll = a; manualPitch = b;
-    goToPose(a, b);
-    Serial.printf("manual pose roll=%.1f pitch=%.1f (PID off)\n", a, b);
+    manualRollPitch(a, b);
+  }
+  else if (sscanf(line, "roll %f", &a) == 1) {          // roll only, keeps the last manual pitch
+    pidEnabled = false;
+    manualRoll = a;
+    manualRollPitch(manualRoll, manualPitch);
+  }
+  else if (sscanf(line, "pitch %f", &a) == 1) {         // pitch only, keeps the last manual roll
+    pidEnabled = false;
+    manualPitch = a;
+    manualRollPitch(manualRoll, manualPitch);
+  }
+  else if (sscanf(line, "horn %f %f", &a, &b) == 2 && a >= 1 && a <= 6) {
+    pidEnabled = false;
+    manualHorn((int)a - 1, b);
+  }
+  else if (sscanf(line, "dir %f %f", &a, &b) == 2 && a >= 1 && a <= 6 && b != 0) {
+    SERVO_DIR[(int)a - 1] = (b > 0) ? +1 : -1;
+    Serial.printf("servo %d dir=%+d\n", (int)a, SERVO_DIR[(int)a - 1]);
   }
   else if (strncmp(line, "home", 4) == 0) {
     pidEnabled = false; manualRoll = manualPitch = 0;
@@ -423,7 +514,7 @@ static void handleLine(char *line) {
     Serial.println("home (PID off)");
   }
   else if (strncmp(line, "tare", 4) == 0) { tareIMU(); }
-  else Serial.println("cmds: kp|ki|kd <v>, pid 1|0, pose <roll> <pitch>, home, tare");
+  else Serial.println("cmds: kp|ki|kd <v>, pid 1|0, manual|pose <roll> <pitch>, roll <deg>, pitch <deg>, horn <1-6> <deg>, dir <1-6> <+1|-1>, home, tare");
 }
 
 static void pollSerial() {
@@ -502,8 +593,8 @@ void loop() {
   if ((uint32_t)(now - lastLoopUs) < LOOP_PERIOD_US) return;
   lastLoopUs = now;
 
-  if (!pidEnabled) return;
-
+  // The IMU is read every cycle, also with the PID off, so the measured tilt can be checked
+  // (e.g. "pose 5 0" -> measured roll should settle near +5; if not, the IMU axes/signs do not match).
   Mat3 C;
   if (!readIMU(C)) {                                  // bad read: keep the last servo command
     imuFailTotal++;
@@ -522,6 +613,13 @@ void loop() {
   float rollDeg, pitchDeg, yawDeg;
   matToEulerDeg(Rrel, rollDeg, pitchDeg, yawDeg);
 
+  if (!pidEnabled) {
+    if (++loopCount % 10 == 0)
+      Serial.printf("PID off | measured roll %.2f pitch %.2f | imu fails %lu\n",
+                    rollDeg, pitchDeg, (unsigned long)imuFailTotal);
+    return;
+  }
+
   float rollCmd  = axisUpdate(ctlRoll,  rollDeg,  dt);
   float pitchCmd = axisUpdate(ctlPitch, pitchDeg, dt);
 
@@ -529,8 +627,9 @@ void loop() {
   float alpha[6];
   float reach = solveSafe(rollCmd, pitchCmd, alpha);
   if (reach < 1.0f) {                                 // keep the controller state at what the platform can do
-    ctlRoll.cmd  *= reach;  ctlPitch.cmd *= reach;
-    rollCmd      *= reach;  pitchCmd     *= reach;
+    rollCmd  *= reach;  pitchCmd *= reach;
+    axisForceCmd(ctlRoll, rollCmd);
+    axisForceCmd(ctlPitch, pitchCmd);
   }
   sendHornAngles(alpha);
 
