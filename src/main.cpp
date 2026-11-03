@@ -14,10 +14,10 @@ static const int  IMU_SCL_PIN  = 23;
 #define BNO_ADDR 0x28                 
 
 static u8   SERVO_IDS[6] = {1, 2, 3, 4, 5, 6};
-static int8_t SERVO_DIR[6] = {+1, +1, +1, +1, +1, +1};   // +1: positive count raises the horn tip. Change live: "dir <1-6> <+1|-1>"
+static int8_t SERVO_DIR[6] = {+1, -1, +1, -1, +1, -1};   // +1: positive count raises the horn tip. Change live: "dir <1-6> <+1|-1>"
 static const int    SERVO_CENTER = 2048;                 // horn must be at its "home" angle here
 static const float  COUNTS_PER_DEG = 4096.0f / 360.0f;   // ST3215: 4096 counts / rev
-static const float  SERVO_LIMIT_DEG = 60.0f;             // max horn travel from home (+/-)
+static const float  SERVO_LIMIT_DEG = 90.0f;             // max horn travel from home (+/-)
 static const u16    SERVO_SPEED = 3000;                  // steps/s (0 = max)
 static const u8     SERVO_ACC   = 0;                     // 0 = no accel ramp (fast response)
 
@@ -58,7 +58,7 @@ static const float LOOP_HZ = 100.0f;           // BNO055 fusion output is 100 Hz
 // oscillates, so keep Kp around 1..2 and raise Ki for stiffness.
 // Tuning: Kd = 0. Start Kp = 1, Ki = 10. Raise Ki (15, 20 ...) for a faster return to level; if it rings
 // after a knock go back to ~70 %. Live: "kp 1.5", "ki 15" ...
-static float Kp = 1.0f, Ki = 10.0f, Kd = 0.0f;
+static float Kp = 0.1f, Ki = 0.0f, Kd = 0.0f;
 
 // Largest tilt command [deg]. The mechanism may reach less (see the "reach" value in the telemetry);
 // solveSafe() cuts the command back to what is reachable anyway.
@@ -620,7 +620,7 @@ void loop() {
     return;
   }
 
-  float rollCmd  = axisUpdate(ctlRoll,  rollDeg,  dt);
+  float rollCmd  = -axisUpdate(ctlRoll,  rollDeg,  dt);
   float pitchCmd = axisUpdate(ctlPitch, pitchDeg, dt);
 
   // inverse kinematics -> horn angles. Never skipped: an unreachable command is scaled back.
