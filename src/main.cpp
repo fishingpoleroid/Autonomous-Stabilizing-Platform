@@ -18,7 +18,7 @@ static int8_t SERVO_DIR[6] = {+1, -1, +1, -1, +1, -1};
 static const int    SERVO_CENTER = 2048;
 static const float  COUNTS_PER_DEG = 4096.0f / 360.0f;
 static const float  SERVO_LIMIT_DEG = 90.0f;
-static const u16    SERVO_SPEED = 3000;
+static const u16    SERVO_SPEED = 3073;
 static const u8     SERVO_ACC   = 0;
 
 static const float R_BASE   = 0.110f;
@@ -26,20 +26,17 @@ static const float R_PLAT   = 0.120f;
 static const float GAMMA_BASE_DEG = 30.0f;
 static const float GAMMA_PLAT_DEG = 35.0f;
 static const float HORN_LEN = 0.020f;
-static const float ROD_LEN  = 0.160f;
+static const float ROD_LEN  = 0.160f;  
 
 static const float HOME_Z_OVERRIDE = 0.0f;
 
-static const bool  USE_MANUAL_BETA = false;
-static const float BETA_MANUAL_DEG[6] = {0, 0, 0, 0, 0, 0};
+static const bool  USE_MANUAL_BETA = true;
+static const float BETA_MANUAL_DEG[6] = {120, 120, 0, 0, 240, 240};
 
 static const float LOOP_HZ = 100.0f;
-static float Kp = 1.0f, Ki = 0.5f, Kd = 2.0f;
+static float Kp = 0.1f, Ki = 1.0f, Kd = 0.025f;
 
-static const float MEAS_ROLL_SIGN  = -1.0f;
-static const float MEAS_PITCH_SIGN = +1.0f;
-
-static const float MAX_TILT_CMD_DEG = 30.0f;
+static const float MAX_TILT_CMD_DEG = 40.0f;
 static const float MAX_TILT_RATE_DPS = 50.0f;
 static const float MEAS_LPF_HZ = 20.0f;
 static const float D_LPF_HZ = 10.0f;
@@ -61,6 +58,11 @@ static float homeZ = 0.0f;
 static float alphaHome[6];
 
 static Mat3 baselineR = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+
+static bool SWAP_ROLL_PITCH = false;
+static float MEAS_ROLL_SIGN  = -1.0f;
+static float MEAS_PITCH_SIGN = 1.0f;
+
 static bool pidEnabled = true;
 static float manualRoll = 0, manualPitch = 0;
 
@@ -135,8 +137,8 @@ static Mat3 quatToMat(float w, float x, float y, float z) {
 
 static bool initGeometry() {
   const float gB = GAMMA_BASE_DEG, gP = GAMMA_PLAT_DEG;
-  const float baseAng[6] = {270 - gB, 150 + gB, 150 - gB, 30 + gB, 30 - gB, 270 + gB};
-  const float platAng[6] = {210 + gP, 210 - gP, 90 + gP, 90 - gP, 330 + gP, 330 - gP};
+  const float baseAng[6] = {360 - gB,   0 + gB, 120 - gB, 120 + gB, 240 - gB, 240 + gB};
+  const float platAng[6] = {300 + gP,  60 - gP,  60 + gP, 180 - gP, 180 + gP, 300 - gP};
 
   float zSum = 0;
   for (int i = 0; i < 6; i++) {
@@ -352,9 +354,9 @@ static float axisUpdate(AxisCtl &a, float meas, float dt) {
   }
   a.mPrev = a.m;
   a.ratePrev = a.rate;
-  a.rate += lpfAlpha(D_LPF_HZ, dt) * ((a.m - a.mPrev) / dt - a.rate);
-
+  
   a.m += lpfAlpha(MEAS_LPF_HZ, dt) * (meas - a.m);
+  a.rate += lpfAlpha(D_LPF_HZ, dt) * ((a.m - a.mPrev) / dt - a.rate);
   
   float dCmd = -Ki * a.m * dt - Kp * (a.m - a.mPrev) - Kd * (a.rate - a.ratePrev);
   float maxStep = MAX_TILT_RATE_DPS * dt;
@@ -386,6 +388,15 @@ static void handleLine(char *line) {
     if (pidEnabled) { ctlRoll.cmd = manualRoll; ctlPitch.cmd = manualPitch; }   
     else goToPose(manualRoll, manualPitch);
     Serial.printf("PID %s\n", pidEnabled ? "ON" : "OFF");
+  }
+  else if (strncmp(line, "swaprp", 4) == 0) {
+    SWAP_ROLL_PITCH = !SWAP_ROLL_PITCH;
+  }
+  else if (strncmp(line, "fliproll", 8) == 0) {
+    MEAS_ROLL_SIGN *= -1;
+  }
+  else if (strncmp(line, "flippitch", 9) == 0) {
+    MEAS_PITCH_SIGN *= -1;
   }
   else if (sscanf(line, "manual %f %f", &a, &b) == 2 || sscanf(line, "pose %f %f", &a, &b) == 2) {
     pidEnabled = false;
@@ -476,7 +487,6 @@ void setup() {
   delay(2500);
 
   // tareIMU();
-  baselineR = buildR(180.0f, 0.0f, 0.0f);
   lastLoopUs = lastCtlUs = micros();
   Serial.println("Running. Type 'help' for commands.");
 }
@@ -503,8 +513,16 @@ void loop() {
   Mat3 Rrel = matMul(transpose(baselineR), C);
   float rollDeg, pitchDeg, yawDeg;
   matToEulerDeg(Rrel, rollDeg, pitchDeg, yawDeg);
+
+  if (SWAP_ROLL_PITCH) {
+    float temp = rollDeg;
+    rollDeg = pitchDeg;
+    pitchDeg = temp;
+  }
+
   rollDeg  *= MEAS_ROLL_SIGN;
   pitchDeg *= MEAS_PITCH_SIGN;
+
 
   if (!pidEnabled) {
     if (++loopCount % 10 == 0)
