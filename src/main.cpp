@@ -522,7 +522,7 @@ static void acceptTelnetClient() {
   telnetClient.setNoDelay(true);
   telnetLineLen = 0;
   telnetIacState = 0;
-  tprintf("Stewart platform telnet ready. Type 'help' for commands.\n");
+  tprintf("Telnet Connected.\n");
 }
 
 static void pollTelnetInput() {
@@ -575,7 +575,7 @@ static void netTask(void *) {
       serverStarted = true;
       tprintf("WiFi connected. Telnet to %s port %u\n", WiFi.localIP().toString().c_str(), TELNET_PORT);
     } else if (!serverStarted && !timeoutWarned && millis() - t0 > WIFI_CONNECT_TIMEOUT_MS) {
-      tprintf("WiFi not connected after %lu s - platform keeps running, still retrying\n",
+      tprintf("WiFi not connected after %lu s\n",
               (unsigned long)(WIFI_CONNECT_TIMEOUT_MS / 1000));
       timeoutWarned = true;
     }
@@ -639,11 +639,10 @@ void setup() {
 
   for (int i = 0; i < 6; i++) st.EnableTorque(SERVO_IDS[i], 1);
   goToPose(0, 0);
-  tprintf("Moving to home, hold the platform level...\n");
+  tprintf("Moving to home.\n");
   delay(2500);
 
   lastLoopUs = lastCtlUs = micros();
-  tprintf("Running. Type 'help' for commands.\n");
 }
 
 void loop() {
