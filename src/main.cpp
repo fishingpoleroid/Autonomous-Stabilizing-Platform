@@ -1,10 +1,24 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
+#include <WiFi.h>
+#include <stdarg.h>
 #include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <SMS_STS.h>
+
+static const char*    WIFI_SSID = "dkg";
+static const char*    WIFI_PASS = "c4di3qit";
+static const uint16_t TELNET_PORT = 23;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+static const bool     MIRROR_TO_SERIAL = true;
+
+static const size_t OUT_BUF_SIZE     = 4096;   
+static const size_t CMD_LEN          = 48;     
+static const int    CMD_QUEUE_DEPTH  = 8;      
 
 static const int  SERVO_RX_PIN = 18;
 static const int  SERVO_TX_PIN = 19;
@@ -49,6 +63,9 @@ static const float RAD2DEG = 180.0f / (float)M_PI;
 SMS_STS st;
 Adafruit_BNO055 bno = Adafruit_BNO055(55, BNO_ADDR, &Wire);
 
+WiFiServer telnetServer(TELNET_PORT);
+WiFiClient telnetClient;
+
 struct Mat3 { float m[3][3]; };
 
 static float bx[6], by[6];
@@ -82,7 +99,53 @@ static uint32_t imuFailTotal = 0;
 static int      imuFailStreak = 0;
 static const uint32_t LOOP_PERIOD_US = (uint32_t)(1000000.0f / LOOP_HZ);
 
+static char    telnetLine[CMD_LEN];
+static uint8_t telnetLineLen = 0;
+static uint8_t telnetIacState = 0;
+
+static char              outBuf[OUT_BUF_SIZE];
+static size_t            outHead = 0, outTail = 0;     
+static volatile uint32_t outDropped = 0;
+static portMUX_TYPE      outMux = portMUX_INITIALIZER_UNLOCKED;
+static QueueHandle_t     cmdQueue = nullptr;
+
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void outPush(const char *d, size_t n) {
+  portENTER_CRITICAL(&outMux);
+  size_t used = (outHead + OUT_BUF_SIZE - outTail) % OUT_BUF_SIZE;
+  if (n <= OUT_BUF_SIZE - 1 - used) {
+    for (size_t i = 0; i < n; i++) {
+      outBuf[outHead] = d[i];
+      if (++outHead == OUT_BUF_SIZE) outHead = 0;
+    }
+  } else {
+    outDropped++;
+  }
+  portEXIT_CRITICAL(&outMux);
+}
+
+static size_t outPop(char *dst, size_t maxN) {
+  size_t n = 0;
+  portENTER_CRITICAL(&outMux);
+  while (n < maxN && outTail != outHead) {
+    dst[n++] = outBuf[outTail];
+    if (++outTail == OUT_BUF_SIZE) outTail = 0;
+  }
+  portEXIT_CRITICAL(&outMux);
+  return n;
+}
+
+static void tprintf(const char *fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+  outPush(buf, (size_t)n);
+}
 
 static Mat3 matMul(const Mat3 &a, const Mat3 &b) {
   Mat3 r;
@@ -153,10 +216,6 @@ static bool initGeometry() {
     float hx = dx - HORN_LEN * cosf(beta[i]);
     float hy = dy - HORN_LEN * sinf(beta[i]);
     float z2 = ROD_LEN * ROD_LEN - hx * hx - hy * hy;
-    if (z2 <= 0) {
-      Serial.printf("Geometry error: leg %d rod too short for this layout\n", i);
-      return false;
-    }
     zSum += sqrtf(z2);
   }
   homeZ = (HOME_Z_OVERRIDE > 0.0f) ? HOME_Z_OVERRIDE : zSum / 6.0f;
@@ -213,7 +272,7 @@ static float solveSafe(float rollDeg, float pitchDeg, float alpha[6]) {
   return lo;
 }
 
-static void sendHornAngles(const float alpha[6]) {
+static void setHorn(const float alpha[6]) {
   s16 pos[6];
   u16 spd[6];
   u8  acc[6];
@@ -231,8 +290,8 @@ static void sendHornAngles(const float alpha[6]) {
 static void goToPose(float rollDeg, float pitchDeg) {
   float alpha[6];
   float scale = solveSafe(rollDeg, pitchDeg, alpha);
-  if (scale < 1.0f) Serial.printf("pose out of reach - using %.0f %% of it\n", scale * 100.0f);
-  sendHornAngles(alpha);
+  if (scale < 1.0f) tprintf("pose out of reach - using %.0f %% of it\n", scale * 100.0f);
+  setHorn(alpha);
 }
 
 static float ikRodError(float rollDeg, float pitchDeg, const float alpha[6]) {
@@ -256,28 +315,25 @@ static void manualRollPitch(float rollDeg, float pitchDeg) {
   float alpha[6];
   float scale = solveSafe(rollDeg, pitchDeg, alpha);
   float r = rollDeg * scale, p = pitchDeg * scale;
-  if (scale < 1.0f) Serial.printf("pose out of reach - using %.0f %% of it (roll %.2f pitch %.2f)\n", scale * 100.0f, r, p);
+  if (scale < 1.0f) tprintf("Out of reach. Moving to (roll %.2f pitch %.2f)\n", scale * 100.0f, r, p);
 
   Mat3 R = buildR(r, p, 0);
-  Serial.printf("manual roll=%.2f pitch=%.2f | IK rod-length error %.6f m (should be ~0)\n", r, p, ikRodError(r, p, alpha));
+  tprintf("manual roll=%.2f pitch=%.2f, r, p");
   for (int i = 0; i < 6; i++) {
-    float plateDz = (R.m[2][0] * px[i] + R.m[2][1] * py[i]) * 1000.0f;       // plate anchor height change [mm]
+    float plateDz = (R.m[2][0] * px[i] + R.m[2][1] * py[i]) * 1000.0f;       
     float deltaDeg = clampf((alpha[i] - alphaHome[i]) * RAD2DEG, -SERVO_LIMIT_DEG, SERVO_LIMIT_DEG);
     int cnt = SERVO_DIR[i] * (int)lroundf(deltaDeg * COUNTS_PER_DEG);
-    Serial.printf("  servo %u: plate anchor %+6.1f mm | horn %s %+6.2f deg | counts %+5d -> %d | dir %+d\n",
-                  SERVO_IDS[i], plateDz, deltaDeg >= 0 ? "UP  " : "DOWN", deltaDeg, cnt,
-                  (int)constrain(SERVO_CENTER + cnt, 0, 4095), SERVO_DIR[i]);
   }
-  sendHornAngles(alpha);
+  setHorn(alpha);
 }
 
 static void manualHorn(int idx, float deltaDeg) {
   float alpha[6];
   for (int i = 0; i < 6; i++) alpha[i] = alphaHome[i];
   alpha[idx] += deltaDeg * DEG2RAD;
-  sendHornAngles(alpha);
-  Serial.printf("servo %u horn %+.1f deg (should go %s), dir %+d\n", SERVO_IDS[idx], deltaDeg,
-                deltaDeg >= 0 ? "UP" : "DOWN", SERVO_DIR[idx]);
+  setHorn(alpha);
+  tprintf("servo %u horn %+.1f deg (should go %s), dir %+d\n", SERVO_IDS[idx], deltaDeg,
+          deltaDeg >= 0 ? "UP" : "DOWN", SERVO_DIR[idx]);
 }
 
 static bool readQuat(float &w, float &x, float &y, float &z) {
@@ -317,7 +373,7 @@ static void recoverI2C() {
   }
   Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN);
   configureI2C();
-  Serial.println("I2C restarted after repeated IMU read failures");
+  tprintf("I2C restarted after repeated IMU read failures\n");
 }
 
 static void tareIMU() {
@@ -332,12 +388,12 @@ static void tareIMU() {
     }
     delay(10);
   }
-  if (cnt == 0) { Serial.println("tare failed: no valid IMU reads, baseline unchanged"); return; }
+  if (cnt == 0) { tprintf("tare failed: no valid IMU reads, baseline unchanged\n"); return; }
   baselineR = quatToMat(w, x, y, z);
   ctlRoll = AxisCtl(); ctlPitch = AxisCtl();
   float r, p, yw;
   matToEulerDeg(baselineR, r, p, yw);
-  Serial.printf("IMU tared (%d samples). baseline roll/pitch/yaw (deg): %.2f %.2f %.2f\n", cnt, r, p, yw);
+  tprintf("IMU tared.");
 }
 
 static float lpfAlpha(float cutoffHz, float dt) {
@@ -379,15 +435,15 @@ static float controlStep(float rollMeas, float pitchMeas, float dt, float alpha[
 
 static void handleLine(char *line) {
   float a = 0, b = 0;
-  if (sscanf(line, "kp %f", &a) == 1)        { Kp = a; Serial.printf("Kp=%.3f\n", Kp); }
-  else if (sscanf(line, "ki %f", &a) == 1)   { Ki = a; Serial.printf("Ki=%.3f\n", Ki); }
-  else if (sscanf(line, "kd %f", &a) == 1)   { Kd = a; Serial.printf("Kd=%.3f\n", Kd); }
+  if (sscanf(line, "kp %f", &a) == 1)        { Kp = a; tprintf("Kp=%.3f\n", Kp); }
+  else if (sscanf(line, "ki %f", &a) == 1)   { Ki = a; tprintf("Ki=%.3f\n", Ki); }
+  else if (sscanf(line, "kd %f", &a) == 1)   { Kd = a; tprintf("Kd=%.3f\n", Kd); }
   else if (sscanf(line, "pid %f", &a) == 1)  {
     pidEnabled = (a != 0);
     ctlRoll = AxisCtl(); ctlPitch = AxisCtl();
     if (pidEnabled) { ctlRoll.cmd = manualRoll; ctlPitch.cmd = manualPitch; }   
     else goToPose(manualRoll, manualPitch);
-    Serial.printf("PID %s\n", pidEnabled ? "ON" : "OFF");
+    tprintf("PID %s\n", pidEnabled ? "ON" : "OFF");
   }
   else if (strncmp(line, "swaprp", 4) == 0) {
     SWAP_ROLL_PITCH = !SWAP_ROLL_PITCH;
@@ -419,34 +475,134 @@ static void handleLine(char *line) {
   }
   else if (sscanf(line, "dir %f %f", &a, &b) == 2 && a >= 1 && a <= 6 && b != 0) {
     SERVO_DIR[(int)a - 1] = (b > 0) ? +1 : -1;
-    Serial.printf("servo %d dir=%+d\n", (int)a, SERVO_DIR[(int)a - 1]);
+    tprintf("servo %d dir=%+d\n", (int)a, SERVO_DIR[(int)a - 1]);
   }
   else if (strncmp(line, "home", 4) == 0) {
     pidEnabled = false; manualRoll = manualPitch = 0;
     goToPose(0, 0);
-    Serial.println("home (PID off)");
+    tprintf("home (PID off)\n");
   }
   else if (strncmp(line, "tare", 4) == 0) { tareIMU(); }
-  else Serial.println("cmds: kp|ki <v>, pid 1|0, manual|pose <roll> <pitch>, roll <deg>, pitch <deg>, horn <1-6> <deg>, dir <1-6> <+1|-1>, home, tare");
+  else tprintf("cmds: kp|ki <v>, pid 1|0, manual|pose <roll> <pitch>, roll <deg>, pitch <deg>, horn <1-6> <deg>, dir <1-6> <+1|-1>, home, tare\n");
 }
 
-static void pollSerial() {
-  static char buf[48];
-  static uint8_t n = 0;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (n > 0) { buf[n] = 0; handleLine(buf); n = 0; }
-    } else if (n < sizeof(buf) - 1) {
-      buf[n++] = c;
+static void pollCommands() {
+  char line[CMD_LEN];
+  if (xQueueReceive(cmdQueue, line, 0) == pdTRUE) {
+    line[CMD_LEN - 1] = 0;
+    handleLine(line);
+  }
+}
+
+static void flushOutput() {
+  char chunk[128];
+  size_t n;
+  while ((n = outPop(chunk, sizeof(chunk))) > 0) {
+    if (MIRROR_TO_SERIAL) Serial.write((const uint8_t *)chunk, n);
+
+    if (telnetClient && telnetClient.connected()) {
+      char out[2 * sizeof(chunk)];
+      size_t m = 0;
+      for (size_t i = 0; i < n; i++) {
+        if (chunk[i] == '\n') out[m++] = '\r';
+        out[m++] = chunk[i];
+      }
+      if (telnetClient.write((const uint8_t *)out, m) < m) telnetClient.stop();   
     }
+  }
+}
+
+static void acceptTelnetClient() {
+  if (!telnetServer.hasClient()) return;
+  WiFiClient nc = telnetServer.available();
+  if (!nc) return;
+
+  telnetClient.stop();                
+  telnetClient = nc;
+  telnetClient.setNoDelay(true);
+  telnetLineLen = 0;
+  telnetIacState = 0;
+  tprintf("Stewart platform telnet ready. Type 'help' for commands.\n");
+}
+
+static void pollTelnetInput() {
+  if (!telnetClient.connected()) { telnetClient.stop(); return; }
+
+  while (telnetClient.available()) {
+    int ci = telnetClient.read();
+    if (ci < 0) break;
+    uint8_t c = (uint8_t)ci;
+
+    if (telnetIacState == 1) {                       
+      if (c >= 251 && c <= 254) telnetIacState = 2;  
+      else if (c == 250)        telnetIacState = 3;  
+      else                      telnetIacState = 0;  
+      continue;
+    }
+    if (telnetIacState == 2) { telnetIacState = 0; continue; }
+    if (telnetIacState == 3) { if (c == 240) telnetIacState = 0; continue; }
+    if (c == 255) { telnetIacState = 1; continue; }
+    if (c == 0) continue;                            
+
+    char ch = (char)c;
+    if (ch == '\n' || ch == '\r') {
+      if (telnetLineLen > 0) {
+        telnetLine[telnetLineLen] = 0;
+        if (xQueueSend(cmdQueue, telnetLine, 0) != pdTRUE) tprintf("command dropped: queue full\n");
+        telnetLineLen = 0;
+      }
+    } else if (telnetLineLen < sizeof(telnetLine) - 1) {
+      telnetLine[telnetLineLen++] = ch;
+    }
+  }
+}
+
+static void netTask(void *) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);       
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  tprintf("Connecting to WiFi '%s' in the background...\n", WIFI_SSID);
+
+  const uint32_t t0 = millis();
+  bool serverStarted = false, timeoutWarned = false;
+  uint32_t reportedDrops = 0;
+
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED && !serverStarted) {
+      telnetServer.begin();
+      telnetServer.setNoDelay(true);
+      serverStarted = true;
+      tprintf("WiFi connected. Telnet to %s port %u\n", WiFi.localIP().toString().c_str(), TELNET_PORT);
+    } else if (!serverStarted && !timeoutWarned && millis() - t0 > WIFI_CONNECT_TIMEOUT_MS) {
+      tprintf("WiFi not connected after %lu s - platform keeps running, still retrying\n",
+              (unsigned long)(WIFI_CONNECT_TIMEOUT_MS / 1000));
+      timeoutWarned = true;
+    }
+
+    if (serverStarted) {
+      acceptTelnetClient();
+      pollTelnetInput();
+    }
+
+    flushOutput();
+
+    uint32_t d = outDropped;
+    if (d != reportedDrops) {
+      reportedDrops = d;
+      tprintf("[%lu output messages dropped so far - output buffer was full]\n", (unsigned long)d);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\nStewart platform (rotary) starting...");
+
+  cmdQueue = xQueueCreate(CMD_QUEUE_DEPTH, CMD_LEN);
+  xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);
 
   Serial1.begin(SERVO_BAUD, SERIAL_8N1, SERVO_RX_PIN, SERVO_TX_PIN);
   st.pSerial = &Serial1;
@@ -454,7 +610,7 @@ void setup() {
 
   Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN);
   if (!bno.begin(OPERATION_MODE_IMUPLUS)) {   
-    Serial.println("BNO055 not found - check wiring / address");
+    tprintf("BNO055 not found.\n");
     while (true) delay(1000);
   }
   delay(1000);
@@ -464,13 +620,13 @@ void setup() {
 
   const float zero3[3] = {0, 0, 0};
   if (!solveIK(zero3, zero3, alphaHome)) {
-    Serial.println("Home pose unreachable - check geometry/HORN_LEN/ROD_LEN");
+    tprintf("Home pose unreachable.\n");
     while (true) delay(1000);
   }
-  Serial.printf("home height = %.4f m\n", homeZ);
+  tprintf("home height = %.4f m\n", homeZ);
   for (int i = 0; i < 6; i++)
-    Serial.printf("leg %d: beta=%.1f deg, horn angle at home=%.1f deg\n",
-                  i, beta[i] * RAD2DEG, alphaHome[i] * RAD2DEG);
+    tprintf("leg %d: beta=%.1f deg, horn angle at home=%.1f deg\n",
+            i, beta[i] * RAD2DEG, alphaHome[i] * RAD2DEG);
 
   for (int dir = 0; dir < 360; dir += 90) {
     float lo = 0, hi = 45, al[6];
@@ -478,21 +634,20 @@ void setup() {
       float mid = 0.5f * (lo + hi);
       if (poseReachable(mid * cosf(dir * DEG2RAD), mid * sinf(dir * DEG2RAD), al)) lo = mid; else hi = mid;
     }
-    Serial.printf("max reachable tilt, direction %3d deg (0 = +roll, 90 = +pitch): %.1f deg\n", dir, lo);
+    tprintf("max reachable tilt, direction %3d deg (0 = +roll, 90 = +pitch): %.1f deg\n", dir, lo);
   }
 
   for (int i = 0; i < 6; i++) st.EnableTorque(SERVO_IDS[i], 1);
   goToPose(0, 0);
-  Serial.println("Moving to home, hold the platform level...");
+  tprintf("Moving to home, hold the platform level...\n");
   delay(2500);
 
-  // tareIMU();
   lastLoopUs = lastCtlUs = micros();
-  Serial.println("Running. Type 'help' for commands.");
+  tprintf("Running. Type 'help' for commands.\n");
 }
 
 void loop() {
-  pollSerial();
+  pollCommands();
 
   uint32_t now = micros();
   if ((uint32_t)(now - lastLoopUs) < LOOP_PERIOD_US) return;
@@ -526,17 +681,17 @@ void loop() {
 
   if (!pidEnabled) {
     if (++loopCount % 10 == 0)
-      Serial.printf("PID off | measured roll %.2f pitch %.2f | imu fails %lu\n",
-                    rollDeg, pitchDeg, (unsigned long)imuFailTotal);
+      tprintf("PID off | measured roll %.2f pitch %.2f | imu fails %lu\n",
+              rollDeg, pitchDeg, (unsigned long)imuFailTotal);
     return;
   }
 
   float alpha[6], rollCmd, pitchCmd;
   float reach = controlStep(rollDeg, pitchDeg, dt, alpha, rollCmd, pitchCmd);
-  sendHornAngles(alpha);
+  setHorn(alpha);
 
   if (++loopCount % 10 == 0) {   
-    Serial.printf("roll %.2f pitch %.2f | cmd %.2f %.2f | reach %.2f | imu fails %lu\n",
-                  rollDeg, pitchDeg, rollCmd, pitchCmd, reach, (unsigned long)imuFailTotal);
+    tprintf("roll %.2f pitch %.2f | cmd %.2f %.2f | reach %.2f | imu fails %lu\n",
+            rollDeg, pitchDeg, rollCmd, pitchCmd, reach, (unsigned long)imuFailTotal);
   }
 }
