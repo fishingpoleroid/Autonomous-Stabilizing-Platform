@@ -34,7 +34,7 @@ static const bool  USE_MANUAL_BETA = true;
 static const float BETA_MANUAL_DEG[6] = {120, 120, 0, 0, 240, 240};
 
 static const float LOOP_HZ = 100.0f;
-static float Kp = 0.1f, Ki = 1.0f, Kd = 0.025f;
+static float Kp = 0.5f, Ki = 3.0f, Kd = 0.025f;
 
 static const float MAX_TILT_CMD_DEG = 40.0f;
 static const float MAX_TILT_RATE_DPS = 50.0f;
