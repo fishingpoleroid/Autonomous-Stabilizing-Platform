@@ -76,6 +76,12 @@ static float alphaHome[6];
 
 static Mat3 baselineR = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
 
+// servo Stats
+static bool SHOW_SERVO = false;
+static float SERVO_LOAD[6];
+static float SERVO_TEMP[6];
+
+static bool SHOW_IMU = true;
 static bool SWAP_ROLL_PITCH = false;
 static float MEAS_ROLL_SIGN  = -1.0f;
 static float MEAS_PITCH_SIGN = 1.0f;
@@ -433,6 +439,13 @@ static float controlStep(float rollMeas, float pitchMeas, float dt, float alpha[
   return reach;
 }
 
+static void getServoStats() {
+  for (int i = 0; i < 6; i++) {
+    SERVO_LOAD[i] = st.ReadLoad(i+1);
+    SERVO_TEMP[i] = st.ReadTemper(i+1);
+  }
+}
+
 static void handleLine(char *line) {
   float a = 0, b = 0;
   if (sscanf(line, "kp %f", &a) == 1)        { Kp = a; tprintf("Kp=%.3f\n", Kp); }
@@ -483,6 +496,8 @@ static void handleLine(char *line) {
     tprintf("home (PID off)\n");
   }
   else if (strncmp(line, "tare", 4) == 0) { tareIMU(); }
+  else if (strncmp(line, "imu", 3) == 0) { SHOW_IMU = !SHOW_IMU; }
+  else if (strncmp(line, "servo", 5) == 0) { SHOW_SERVO = !SHOW_SERVO; }
   else tprintf("cmds: kp|ki <v>, pid 1|0, manual|pose <roll> <pitch>, roll <deg>, pitch <deg>, horn <1-6> <deg>, dir <1-6> <+1|-1>, home, tare\n");
 }
 
@@ -653,6 +668,7 @@ void loop() {
   lastLoopUs = now;
 
   Mat3 C;
+  getServoStats();
   if (!readIMU(C)) {                                  
     imuFailTotal++;
     if (++imuFailStreak >= IMU_RECOVER_AFTER_FAILS) { recoverI2C(); imuFailStreak = 0; }
@@ -689,8 +705,14 @@ void loop() {
   float reach = controlStep(rollDeg, pitchDeg, dt, alpha, rollCmd, pitchCmd);
   setHorn(alpha);
 
-  if (++loopCount % 10 == 0) {   
+  if (SHOW_IMU && ++loopCount % 10 == 0) {   
     tprintf("roll %.2f pitch %.2f | cmd %.2f %.2f | reach %.2f | imu fails %lu\n",
             rollDeg, pitchDeg, rollCmd, pitchCmd, reach, (unsigned long)imuFailTotal);
+  }
+
+  if (SHOW_SERVO && ++loopCount % 10 == 0) {   
+    tprintf("Servo Loads:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f    Servo Temperatures:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f\n", 
+      SERVO_LOAD[0], SERVO_LOAD[1], SERVO_LOAD[2], SERVO_LOAD[3], SERVO_LOAD[4], SERVO_LOAD[5],
+      SERVO_TEMP[1], SERVO_TEMP[1], SERVO_TEMP[2], SERVO_TEMP[3], SERVO_TEMP[4], SERVO_TEMP[5]);
   }
 }
