@@ -86,6 +86,9 @@ static bool SWAP_ROLL_PITCH = false;
 static float MEAS_ROLL_SIGN  = -1.0f;
 static float MEAS_PITCH_SIGN = 1.0f;
 
+static float mroll = 0;
+static float mpitch = 0;
+
 static bool pidEnabled = true;
 static float manualRoll = 0, manualPitch = 0;
 
@@ -470,6 +473,7 @@ static void handleLine(char *line) {
   else if (sscanf(line, "manual %f %f", &a, &b) == 2 || sscanf(line, "pose %f %f", &a, &b) == 2) {
     pidEnabled = false;
     manualRoll = a; manualPitch = b;
+    mroll = a, mpitch = b;
     manualRollPitch(a, b);
   }
   else if (sscanf(line, "roll %f", &a) == 1) {          
@@ -498,6 +502,34 @@ static void handleLine(char *line) {
   else if (strncmp(line, "tare", 4) == 0) { tareIMU(); }
   else if (strncmp(line, "imu", 3) == 0) { SHOW_IMU = !SHOW_IMU; }
   else if (strncmp(line, "servo", 5) == 0) { SHOW_SERVO = !SHOW_SERVO; }
+  else if (strncmp(line, "i", 1) == 0) { 
+    pidEnabled= false;
+    mpitch += 1;
+    mroll = clampf(mroll, -15, 15);
+    mpitch = clampf(mpitch, -15, 15);
+    manualRollPitch(mroll, mpitch);
+  }
+  else if (strncmp(line, "j", 1) == 0) {
+    pidEnabled = false;
+    mroll -= 1;
+    mroll = clampf(mroll, -15, 15);
+    mpitch = clampf(mpitch, -15, 15);
+    manualRollPitch(mroll, mpitch);
+  }
+  else if (strncmp(line, "k", 1) == 0) {
+    pidEnabled = false;
+    mpitch -= 1;
+    mroll = clampf(mroll, -15, 15);
+    mpitch = clampf(mpitch, -15, 15);
+    manualRollPitch(mroll, mpitch);
+  }
+  else if (strncmp(line, "l", 1) == 0) {
+    pidEnabled = false;
+    mroll += 1;
+    mroll = clampf(mroll, -15, 15);
+    mpitch = clampf(mpitch, -15, 15);
+    manualRollPitch(mroll, mpitch);
+  }
   else tprintf("cmds: kp|ki <v>, pid 1|0, manual|pose <roll> <pitch>, roll <deg>, pitch <deg>, horn <1-6> <deg>, dir <1-6> <+1|-1>, home, tare\n");
 }
 
