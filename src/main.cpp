@@ -711,8 +711,8 @@ void loop() {
   }
 
   if (SHOW_SERVO && ++loopCount % 10 == 0) {   
-    tprintf("Servo Loads:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f    Servo Temperatures:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f\n", 
+    tprintf("Servo Loads:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f    Servo Temperatures:  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f  |  %.2f\n", 
       SERVO_LOAD[0], SERVO_LOAD[1], SERVO_LOAD[2], SERVO_LOAD[3], SERVO_LOAD[4], SERVO_LOAD[5],
-      SERVO_TEMP[1], SERVO_TEMP[1], SERVO_TEMP[2], SERVO_TEMP[3], SERVO_TEMP[4], SERVO_TEMP[5]);
+      SERVO_TEMP[0], SERVO_TEMP[1], SERVO_TEMP[2], SERVO_TEMP[3], SERVO_TEMP[4], SERVO_TEMP[5]);
   }
 }
